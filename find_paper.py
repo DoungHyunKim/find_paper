@@ -1,3 +1,5 @@
+from itertools import count
+
 import cv2
 import numpy as np
 
@@ -35,86 +37,133 @@ def find_corners(lines, img_shape):
     Returns:
       이미지 네 모서리 좌표 리스트
     """
-    # 직선 필터링 (길이 기준)
-    lines = [line for line in lines if
-             np.linalg.norm(np.array(line[0][:2]) - np.array(line[0][2:])) > img_shape[1] * 0.1]  # 가로 길이의 10% 이상인 직선만 선택
+    if lines is None:
+        raise ValueError("No lines detected.")
 
-    # 직선 필터링 (기울기 기준)
-    def get_angle(line):
-        x1, y1, x2, y2 = line[0]
-        return np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi
-
-    lines = [line for line in lines if abs(get_angle(line)) < 10 or abs(get_angle(line)) > 80]  # 기울기가 10도 이하 또는 80도 이상인 직선만 선택
-
+    # 교점 찾기
     intersections = []
     for i, line1 in enumerate(lines):
         for j, line2 in enumerate(lines):
             if i >= j:
                 continue
-
-            # Extract coordinates
             x1, y1, x2, y2 = line1[0]
             x3, y3, x4, y4 = line2[0]
 
-            # Compute slopes and intercepts
-            m1 = (y2 - y1) / (x2 - x1) if (x2 - x1) != 0 else np.inf
-            c1 = y1 - m1 * x1 if m1 != np.inf else np.inf
+            # 두 직선의 기울기 계산
+            m1 = (y2 - y1) / (x2 - x1) if x2 != x1 else np.inf
+            m2 = (y4 - y3) / (x4 - x3) if x4 != x3 else np.inf
 
-            m2 = (y4 - y3) / (x4 - x3) if (x4 - x3) != 0 else np.inf
-            c2 = y3 - m2 * x3 if m2 != np.inf else np.inf
-
-            # Skip parallel lines
+            # 기울기가 같은 직선(평행) 제외
             if m1 == m2:
                 continue
 
-            # Compute intersection
-            if m1 == np.inf:  # Line1 vertical
+            # 교점 계산
+            if m1 == np.inf:
                 x = x1
-                y = m2 * x + c2
-            elif m2 == np.inf:  # Line2 vertical
+                y = m2 * x + (y3 - m2 * x3)
+            elif m2 == np.inf:
                 x = x3
-                y = m1 * x + c1
+                y = m1 * x + (y1 - m1 * x1)
             else:
-                x = (c2 - c1) / (m1 - m2)
-                y = m1 * x + c1
+                x = (y3 - y1 + m1 * x1 - m2 * x3) / (m1 - m2)
+                y = m1 * x + (y1 - m1 * x1)
 
-            # Check if the intersection is within image bounds
+            # 이미지 경계 내에 있는 교점만 저장
             if 0 <= x < img_shape[1] and 0 <= y < img_shape[0]:
                 intersections.append((int(x), int(y)))
 
     if len(intersections) < 4:
         raise ValueError("Not enough valid corners found.")
 
-    # 디버깅
-    print(f"Found {len(intersections)} intersections.")
-
+    # y좌표, x좌표 순으로 정렬하여 좌상단, 좌하단, 우상단, 우하단 순서로 정렬
     intersections = sorted(intersections, key=lambda p: (p[1], p[0]))
-    return intersections[:4]  # 네 모서리
+
+    # 네 모서리 반환
+    return intersections[:4]
 
 
 def detect_paper(image):
     """
-    이미지에서 용지를 인식하는 함수
+    색상 정보와 윤곽선 검출을 사용하여 이미지에서 흰색 포스트잇을 인식하는 함수
 
     Args:
       image: 입력 이미지
 
     Returns:
-      용지 영역의 좌표 (x, y, w, h)
+      변환된 포스트잇 이미지 또는 None
     """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blurred, 50, 200) # 1. 75/200 2. 50/200
 
-    cnts = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # HSV 색 공간으로 변환
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+    # 흰색 범위 지정 (필요에 따라 범위 조정)
+    lower_white = np.array([0, 0, 180])  # 흰색 범위 하한
+    upper_white = np.array([180, 50, 255])  # 흰색 범위 상한
+
+    # 흰색 영역 마스크 생성
+    mask = cv2.inRange(hsv, lower_white, upper_white)
+
+    # 모폴로지 연산을 사용하여 노이즈 제거
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # 윤곽선 검출
+    cnts = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cnts = cnts[0] if len(cnts) == 2 else cnts[1]
-    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:5]
 
-    for c in cnts:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+    # 디버깅
+    # print("mask shape:", mask.shape)  # 마스크 크기 출력
+    # print("mask unique values:", np.unique(mask))  # 마스크에 포함된 유일한 값 출력 (0 또는 255)
+    # cv2.imshow("mask", mask)  # 마스크 이미지 출력
+    # cv2.waitKey(0)
+    # print("number of contours:", len(cnts))  # 윤곽선 개수 출력
+    # for i, cnt in enumerate(cnts):
+    #     print(f"contour {i} area:", cv2.contourArea(cnt))  # 각 윤곽선의 면적 출력
+
+
+    if cnts:
+        # 가장 큰 윤곽선 찾기
+        cnt = max(cnts, key=cv2.contourArea)
+
+        # 윤곽선 근사 및 꼭짓점 찾기
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
+
+        # 디버깅용
+        # print(count(approx))
+
         if len(approx) == 4:
-            return cv2.boundingRect(approx)
+            # 이미지 변환: 특정 시점에서 바라본 것처럼 변환한다. Perspective Transform 행렬을 사용
+            pts1 = np.float32(approx)
+            pts2 = np.float32([[0, 0], [0, 300], [400, 300], [400, 0]])  # 변환될 좌표 (크기는 임의로 설정)
+            matrix = cv2.getPerspectiveTransform(pts1, pts2)
+            transformed_image = cv2.warpPerspective(image, matrix, (400, 300))
+
+            # 노이즈 제거
+            # transformed_image = cv2.fastNlMeansDenoisingColored(transformed_image, None, 5, 5, 7, 21)
+
+            # 샤프닝 필터 적용
+            # kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+            # transformed_image = cv2.filter2D(transformed_image, -1, kernel)
+
+            # 변환된 이미지에서 용지 영역 파란색으로 표시(디버깅용)
+            cv2.drawContours(image, [approx], -1, (255, 0, 0), 3)  # 파란색으로 윤곽선 그림
+
+            # 이미지 크기 조정 (동적 크기 조정)
+            height, width = transformed_image.shape[:2]
+            target_width = 1000  # 예시: 가로 길이 1000 픽셀을 기준으로 조정
+            if width > target_width:
+                new_width = target_width
+                new_height = int(height * (target_width / width))
+                transformed_image = cv2.resize(transformed_image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+            return transformed_image
+            # 디버깅용
+            # print("corners:", approx)  # 네 꼭짓점 좌표 출력
+            # print("transformed image shape:", transformed_image.shape)  # 변환된 이미지 크기 출력
+
+            return transformed_image
 
     return None  # 용지 인식 실패 시 None 반환
 
@@ -130,72 +179,28 @@ def detect_lines(image_path, brightness_value=50):  # 밝기 조절 값을 인�
     # 이미지 로드
     image = cv2.imread(image_path)
 
+    # 디비거깅용
+    # print(image.shape)
+
     # 밝기 조절 적용
     image = adjust_brightness(image, brightness_value)
 
     # 용지 인식
-    paper_rect = detect_paper(image)
+    transformed_image = detect_paper(image)  # 변환된 이미지를 받아옴
 
-    if paper_rect is not None:
-        x, y, w, h = paper_rect
-        cv2.rectangle(image, (x, y), (x + w, y + h), (255, 0, 0), 2)  # 파란색 사각형으로 용지 영역 표시
+    # 디비거깅용
+    # print("transformed_image:", transformed_image)
 
-    # 그레이스케일로 변환
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if transformed_image is not None:
+        # 변환된 이미지 출력
+        cv2.imshow("Transformed Image", transformed_image)  # 변환된 이미지 출력
 
-    # 노이즈 제거( 미디언 필터 적용)
-    gray = cv2.medianBlur(gray, 5)  # 5x5 커널 크기의 미디언 필터 적용
-
-    # Canny 엣지 검출
-    edges = cv2.Canny(gray, 50, 150)
-
-    # 이미지 크기 분석
-    height, width = edges.shape
-    diagonal_length = int(np.sqrt(height ** 2 + width ** 2))  # 이미지의 대각선 길이
-
-    # minLineLength: 전체 길이에 비례하도록 설정
-    min_line_length = int(0.05 * diagonal_length)  # 대각선의 5% 정도로 설정 (기존 2%에서 증가)
-
-    # maxLineGap: 전체 폭과 비례
-    max_line_gap = int(0.01 * width)  # 가로 길이의 1% 정도로 설정
-
-    # threshold: 엣지 밀도에 따라 조정 (경험적인 값 사용)
-    non_zero_edges = cv2.countNonZero(edges)  # 엣지가 있는 픽셀 수
-    edge_density = non_zero_edges / (height * width)
-    if edge_density > 0.05:  # 엣지가 많을 경우 높은 threshold
-        threshold = 150  # 기존 100에서 증가
-    else:  # 엣지가 적을 경우 낮은 threshold
-        threshold = 80  # 기존 50에서 증가
-
-    # 확장 허프 변환(직선 검출)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold,
-                            minLineLength=min_line_length,
-                            maxLineGap=max_line_gap)
-
-    # 코너 찾기
-    try:
-        corners = find_corners(lines, image.shape)
-
-        # 코너 표시
-        for corner in corners:
-            cv2.circle(image, corner, 10, (0, 0, 255), -1)  # 빨간색 점으로 코너 표시
-    except ValueError as e:
-        print(f"Error: {e}")
-
-    # 직선이 발견되었으면
-    if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            # 이미지에 직선 그리기
-            cv2.line(image, (x1, y1), (x2, y2), (0, 255, 0), 2)  # 초록색 선
-
-    # 결과 이미지 출력
-    cv2.imshow("Detected Lines and Corners", image)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
+        # 원본 이미지에 용지 영역 표시 (디버깅용)
+        cv2.imshow("Original Image with Paper", image)  # 원본 이미지 출력
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
 
 # 이미지 경로 지정
-image_path = "test1.jpg"
+image_path = "test7.JPG"
 brightness_value = 50
 detect_lines(image_path, brightness_value)
